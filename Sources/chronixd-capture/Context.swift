@@ -18,6 +18,15 @@ struct Context: ParsableCommand {
     @Option(name: .long, help: "Duration like 30m, 1h, 2h30m, or seconds.")
     var last: String?
 
+    @Option(
+        name: .customLong("device"),
+        help: "Capture device hostname to include. Repeat for multiple devices, or use 'current' for this Mac. Defaults to all."
+    )
+    var devices: [String] = []
+
+    @Flag(name: .customLong("list-devices"), help: "List capture device hostnames found in capture files.")
+    var listDevices: Bool = false
+
     @Flag(name: .long, help: "Output all record types with full fields.")
     var detail: Bool = false
 
@@ -29,6 +38,10 @@ struct Context: ParsableCommand {
         guard dataDir != nil else {
             throw ValidationError("--data-dir is required.")
         }
+        if listDevices && !devices.isEmpty {
+            throw ValidationError("--list-devices and --device are mutually exclusive.")
+        }
+        if listDevices { return }
         if last != nil && from != nil {
             throw ValidationError("--last and --from are mutually exclusive.")
         }
@@ -44,6 +57,14 @@ struct Context: ParsableCommand {
         }
 
         guard let dataDir else { return }
+        let store = CaptureStore(dataDir: dataDir)
+
+        if listDevices {
+            for device in store.availableDevices() {
+                print(device)
+            }
+            return
+        }
 
         let now = Date()
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
@@ -65,8 +86,10 @@ struct Context: ParsableCommand {
             throw CleanExit.message("Specify either --last or --from.")
         }
 
-        let store = CaptureStore(dataDir: dataDir)
-        var records = try store.readRecords(from: startMs, to: endMs)
+        let selectedDevices = devices.isEmpty ? nil : Set(devices.map {
+            $0 == "current" ? CaptureStore.currentDevice : CaptureStore.normalizeDeviceName($0)
+        })
+        var records = try store.readRecords(from: startMs, to: endMs, devices: selectedDevices)
         records.sort { lhs, rhs in
             timeMs(of: lhs) < timeMs(of: rhs)
         }
@@ -198,7 +221,7 @@ struct Context: ParsableCommand {
 
     ## Common Fields
 
-    All records (except summary written by external tools and one-shot snapshot) include:
+    All records include:
     - sessionId: string? — 8-char hex identifying one chronixd-capture process invocation. Use to groupBy events from the same session. Resets every restart.
 
     ## Record Types
@@ -244,14 +267,6 @@ struct Context: ParsableCommand {
     - path: string? — camera image file path
     - available: boolean — whether the image file exists
 
-    ### summary
-    Analysis results written by external tools to {data-dir}/summaries/.
-    - type: "summary"
-    - fromUnixTimeMs: number — analysis period start (Unix ms)
-    - toUnixTimeMs: number — analysis period end (Unix ms)
-    - sessionId: string? — Optional, written by external tools
-    - text: string — analysis text
-
     ## Usage
 
     # Get last 30 minutes of activity
@@ -259,6 +274,15 @@ struct Context: ParsableCommand {
 
     # Get full details including file paths
     chronixd-capture context --data-dir <path> --last 30m --detail
+
+    # List capture devices available in the data directory
+    chronixd-capture context --data-dir <path> --list-devices
+
+    # Get context captured on this Mac only
+    chronixd-capture context --data-dir <path> --last 30m --device current
+
+    # Get context from one named device
+    chronixd-capture context --data-dir <path> --last 30m --device work-laptop
 
     # Specific time range
     chronixd-capture context --data-dir <path> --from 10:00 --to 11:00
@@ -268,6 +292,9 @@ struct Context: ParsableCommand {
 
     ## Tips for analysis
     - Records are sorted by timestamp
+    - When data from multiple Macs is synced into one data-dir, use --device to avoid mixing their timelines
+    - --device values are normalized hostnames from capture filenames; use --list-devices to discover them
+    - --device current selects the normalized hostname of the Mac running this command
     - screenshot records show what app/page the user was looking at
     - transcription records show what the user was saying
     - is_focused: true indicates the display the user was actively using
@@ -284,7 +311,6 @@ private func timeMs(of record: any CaptureRecord) -> Int64 {
     case let r as ScreenshotRecord: return r.unixTimeMs
     case let r as TranscriptionRecord: return r.unixTimeMs
     case let r as CameraRecord: return r.unixTimeMs
-    case let r as SummaryRecord: return r.fromUnixTimeMs
     default: return 0
     }
 }

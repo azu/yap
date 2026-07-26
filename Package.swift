@@ -22,5 +22,9 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ]
         ),
+        .testTarget(
+            name: "chronixd-captureTests",
+            dependencies: ["chronixd-capture"]
+        ),
     ]
 )

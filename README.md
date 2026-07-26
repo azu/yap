@@ -28,19 +28,21 @@ OPTIONS:
 ### Context
 
 ```
-USAGE: chronixd-capture context --data-dir <data-dir> [--from <from>] [--to <to>] [--last <last>] [--detail] [--schema]
+USAGE: chronixd-capture context --data-dir <data-dir> [--from <from>] [--to <to>] [--last <last>] [--device <device> ...] [--list-devices] [--detail] [--schema]
 
 OPTIONS:
   --data-dir <data-dir>   Data directory (required).
   --from <from>           Start time (ISO 8601 or HH:mm for today).
   --to <to>               End time (defaults to now).
   --last <last>           Duration like 30m, 1h, 2h30m.
+  --device <device>       Capture device hostname to include. Repeat for multiple devices, or use `current` for this Mac. Defaults to all.
+  --list-devices          List capture device hostnames found in capture files.
   --detail                Output all record types with full fields.
   --schema                Print the output schema for AI consumption.
   -h, --help              Show help information.
 ```
 
-Output is NDJSON with `type` field per record: `screenshot`, `transcription`, `camera`, `summary`.
+Output is NDJSON with `type` field per record: `screenshot`, `transcription`, `camera`.
 
 > Microphone, Screen Recording, and Accessibility permissions are required. Camera permission is needed when using `--camera`.
 
@@ -59,6 +61,15 @@ chronixd-capture context --data-dir ~/chronixd-data --last 30m
 # Query with full details (image paths, transcription)
 chronixd-capture context --data-dir ~/chronixd-data --last 1h --detail
 
+# List capture devices available in the data directory
+chronixd-capture context --data-dir ~/chronixd-data --list-devices
+
+# Query only context captured on the current Mac
+chronixd-capture context --data-dir ~/chronixd-data --last 1h --device current
+
+# Query one named capture device
+chronixd-capture context --data-dir ~/chronixd-data --last 1h --device work-laptop
+
 # Query a specific time range
 chronixd-capture context --data-dir ~/chronixd-data --from "10:00" --to "11:30" --detail
 
@@ -73,7 +84,6 @@ chronixd-capture context --data-dir ~/chronixd-data --last 30m --detail | claude
 | Screenshots | `/tmp/chronixd-capture/{session}/screenshots/` | Temporary (OS cleanup) |
 | Camera images | `/tmp/chronixd-capture/{session}/cameras/` | Temporary |
 | Structured data (NDJSON) | `{data-dir}/captures/` | Persistent |
-| Summaries (NDJSON) | `{data-dir}/summaries/` | Persistent (written by external tools) |
 
 ### Install
 

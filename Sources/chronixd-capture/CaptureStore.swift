@@ -7,7 +7,6 @@ final class CaptureStore: Sendable {
     let sessionID: String
 
     var capturesDir: String { dataDir + "/captures/" }
-    var summariesDir: String { dataDir + "/summaries/" }
     var tmpDir: String { NSTemporaryDirectory() + "chronixd-capture/" + sessionID + "/" }
     var screenshotsDir: String { tmpDir + "screenshots/" }
     var camerasDir: String { tmpDir + "cameras/" }
@@ -24,22 +23,25 @@ final class CaptureStore: Sendable {
     func setup() throws {
         let fm = FileManager.default
         try fm.createDirectory(atPath: capturesDir, withIntermediateDirectories: true)
-        try fm.createDirectory(atPath: summariesDir, withIntermediateDirectories: true)
         try fm.createDirectory(atPath: screenshotsDir, withIntermediateDirectories: true)
         try fm.createDirectory(atPath: camerasDir, withIntermediateDirectories: true)
     }
 
     /// Short hostname used to partition NDJSON files per machine, avoiding git merge conflicts.
     /// Normalized to lowercase alphanumeric and hyphens only.
-    private static let hostname: String = {
+    static let currentDevice: String = {
         let raw = ProcessInfo.processInfo.hostName
-            .components(separatedBy: ".").first ?? "unknown"
-        let normalized = raw.lowercased()
+        return normalizeDeviceName(raw)
+    }()
+
+    static func normalizeDeviceName(_ raw: String) -> String {
+        let shortName = raw.components(separatedBy: ".").first ?? "unknown"
+        let normalized = shortName.lowercased()
             .replacing(/[^a-z0-9\-]/, with: "-")
             .replacing(/\-{2,}/, with: "-")
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return normalized.isEmpty ? "unknown" : normalized
-    }()
+    }
 
     /// Append records to the daily per-host NDJSON file (e.g. 2026-03-22_macbook.ndjson).
     func writeCapture(records: [any CaptureRecord], timestamp: Date) throws {
@@ -49,7 +51,7 @@ final class CaptureStore: Sendable {
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
-        let filename = "\(formatter.string(from: timestamp))_\(Self.hostname).ndjson"
+        let filename = "\(formatter.string(from: timestamp))_\(Self.currentDevice).ndjson"
         let path = capturesDir + filename
 
         if FileManager.default.fileExists(atPath: path) {
@@ -62,12 +64,21 @@ final class CaptureStore: Sendable {
         }
     }
 
-    /// Read all records from captures and summaries within a time range.
-    func readRecords(from startMs: Int64, to endMs: Int64) throws -> [any CaptureRecord] {
-        var records: [any CaptureRecord] = []
-        records += try readNDJSONFiles(in: capturesDir, from: startMs, to: endMs)
-        records += try readNDJSONFiles(in: summariesDir, from: startMs, to: endMs)
-        return records
+    /// Read all records from captures within a time range.
+    func readRecords(
+        from startMs: Int64,
+        to endMs: Int64,
+        devices: Set<String>? = nil
+    ) throws -> [any CaptureRecord] {
+        try readNDJSONFiles(in: capturesDir, from: startMs, to: endMs, devices: devices)
+    }
+
+    /// Capture device hostnames encoded in per-host NDJSON filenames.
+    func availableDevices() -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: capturesDir) else {
+            return []
+        }
+        return Array(Set(files.compactMap(Self.deviceName(from:)))).sorted()
     }
 
     /// Resolve a record ID to tmp file paths by searching across all sessions.
@@ -93,11 +104,19 @@ final class CaptureStore: Sendable {
         return (nil, nil)
     }
 
-    private func readNDJSONFiles(in directory: String, from startMs: Int64, to endMs: Int64) throws -> [any CaptureRecord] {
+    private func readNDJSONFiles(
+        in directory: String,
+        from startMs: Int64,
+        to endMs: Int64,
+        devices: Set<String>?
+    ) throws -> [any CaptureRecord] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return [] }
         var records: [any CaptureRecord] = []
         for file in files.sorted() where file.hasSuffix(".ndjson") {
+            if let devices {
+                guard let device = Self.deviceName(from: file), devices.contains(device) else { continue }
+            }
             let path = directory + file
             guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
             for line in content.components(separatedBy: "\n") where !line.isEmpty {
@@ -110,12 +129,20 @@ final class CaptureStore: Sendable {
         return records
     }
 
+    private static func deviceName(from filename: String) -> String? {
+        guard let match = filename.wholeMatch(
+            of: /\d{4}-\d{2}-\d{2}_(?<device>[a-z0-9][a-z0-9\-]*)\.ndjson/
+        ) else {
+            return nil
+        }
+        return String(match.device)
+    }
+
     private func isInRange(record: any CaptureRecord, from startMs: Int64, to endMs: Int64) -> Bool {
         switch record {
         case let r as ScreenshotRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         case let r as TranscriptionRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         case let r as CameraRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
-        case let r as SummaryRecord: return r.toUnixTimeMs >= startMs && r.fromUnixTimeMs <= endMs
         default: return false
         }
     }
