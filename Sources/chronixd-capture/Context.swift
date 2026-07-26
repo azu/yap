@@ -24,7 +24,7 @@ struct Context: ParsableCommand {
     )
     var devices: [String] = []
 
-    @Flag(name: .customLong("list-devices"), help: "List capture device hostnames found in data-dir.")
+    @Flag(name: .customLong("list-devices"), help: "List capture device hostnames found in capture files.")
     var listDevices: Bool = false
 
     @Flag(name: .long, help: "Output all record types with full fields.")
@@ -221,7 +221,7 @@ struct Context: ParsableCommand {
 
     ## Common Fields
 
-    All records (except summary written by external tools and one-shot snapshot) include:
+    All records include:
     - sessionId: string? — 8-char hex identifying one chronixd-capture process invocation. Use to groupBy events from the same session. Resets every restart.
 
     ## Record Types
@@ -267,14 +267,6 @@ struct Context: ParsableCommand {
     - path: string? — camera image file path
     - available: boolean — whether the image file exists
 
-    ### summary
-    Analysis results written by external tools to {data-dir}/summaries/.
-    - type: "summary"
-    - fromUnixTimeMs: number — analysis period start (Unix ms)
-    - toUnixTimeMs: number — analysis period end (Unix ms)
-    - sessionId: string? — Optional, written by external tools
-    - text: string — analysis text
-
     ## Usage
 
     # Get last 30 minutes of activity
@@ -319,7 +311,6 @@ private func timeMs(of record: any CaptureRecord) -> Int64 {
     case let r as ScreenshotRecord: return r.unixTimeMs
     case let r as TranscriptionRecord: return r.unixTimeMs
     case let r as CameraRecord: return r.unixTimeMs
-    case let r as SummaryRecord: return r.fromUnixTimeMs
     default: return 0
     }
 }

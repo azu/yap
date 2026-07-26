@@ -7,7 +7,6 @@ final class CaptureStore: Sendable {
     let sessionID: String
 
     var capturesDir: String { dataDir + "/captures/" }
-    var summariesDir: String { dataDir + "/summaries/" }
     var tmpDir: String { NSTemporaryDirectory() + "chronixd-capture/" + sessionID + "/" }
     var screenshotsDir: String { tmpDir + "screenshots/" }
     var camerasDir: String { tmpDir + "cameras/" }
@@ -24,7 +23,6 @@ final class CaptureStore: Sendable {
     func setup() throws {
         let fm = FileManager.default
         try fm.createDirectory(atPath: capturesDir, withIntermediateDirectories: true)
-        try fm.createDirectory(atPath: summariesDir, withIntermediateDirectories: true)
         try fm.createDirectory(atPath: screenshotsDir, withIntermediateDirectories: true)
         try fm.createDirectory(atPath: camerasDir, withIntermediateDirectories: true)
     }
@@ -66,16 +64,13 @@ final class CaptureStore: Sendable {
         }
     }
 
-    /// Read all records from captures and summaries within a time range.
+    /// Read all records from captures within a time range.
     func readRecords(
         from startMs: Int64,
         to endMs: Int64,
         devices: Set<String>? = nil
     ) throws -> [any CaptureRecord] {
-        var records: [any CaptureRecord] = []
-        records += try readNDJSONFiles(in: capturesDir, from: startMs, to: endMs, devices: devices)
-        records += try readNDJSONFiles(in: summariesDir, from: startMs, to: endMs, devices: devices)
-        return records
+        try readNDJSONFiles(in: capturesDir, from: startMs, to: endMs, devices: devices)
     }
 
     /// Capture device hostnames encoded in per-host NDJSON filenames.
@@ -148,7 +143,6 @@ final class CaptureStore: Sendable {
         case let r as ScreenshotRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         case let r as TranscriptionRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         case let r as CameraRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
-        case let r as SummaryRecord: return r.toUnixTimeMs >= startMs && r.fromUnixTimeMs <= endMs
         default: return false
         }
     }

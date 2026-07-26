@@ -6,7 +6,6 @@ enum CaptureRecordType: String, Codable, Sendable {
     case screenshot
     case transcription
     case camera
-    case summary
 }
 
 protocol CaptureRecord: Codable, Sendable {
@@ -60,18 +59,6 @@ struct CameraRecord: CaptureRecord, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case type, id, unixTimeMs, sessionId
-    }
-}
-
-struct SummaryRecord: CaptureRecord, Codable, Sendable {
-    let type: CaptureRecordType = .summary
-    let fromUnixTimeMs: Int64
-    let toUnixTimeMs: Int64
-    let sessionId: String?
-    let text: String
-
-    enum CodingKeys: String, CodingKey {
-        case type, fromUnixTimeMs, toUnixTimeMs, sessionId, text
     }
 }
 
@@ -132,7 +119,6 @@ enum CaptureRecordCoder {
         case let r as ScreenshotRecord: data = try encoder.encode(r)
         case let r as TranscriptionRecord: data = try encoder.encode(r)
         case let r as CameraRecord: data = try encoder.encode(r)
-        case let r as SummaryRecord: data = try encoder.encode(r)
         default: throw EncodingError.invalidValue(record, .init(codingPath: [], debugDescription: "Unknown record type"))
         }
         return String(data: data, encoding: .utf8) ?? ""
@@ -152,7 +138,6 @@ enum CaptureRecordCoder {
         case .screenshot: return try decoder.decode(ScreenshotRecord.self, from: data)
         case .transcription: return try decoder.decode(TranscriptionRecord.self, from: data)
         case .camera: return try decoder.decode(CameraRecord.self, from: data)
-        case .summary: return try decoder.decode(SummaryRecord.self, from: data)
         }
     }
 

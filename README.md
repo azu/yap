@@ -36,13 +36,13 @@ OPTIONS:
   --to <to>               End time (defaults to now).
   --last <last>           Duration like 30m, 1h, 2h30m.
   --device <device>       Capture device hostname to include. Repeat for multiple devices, or use `current` for this Mac. Defaults to all.
-  --list-devices          List capture device hostnames found in data-dir.
+  --list-devices          List capture device hostnames found in capture files.
   --detail                Output all record types with full fields.
   --schema                Print the output schema for AI consumption.
   -h, --help              Show help information.
 ```
 
-Output is NDJSON with `type` field per record: `screenshot`, `transcription`, `camera`, `summary`.
+Output is NDJSON with `type` field per record: `screenshot`, `transcription`, `camera`.
 
 > Microphone, Screen Recording, and Accessibility permissions are required. Camera permission is needed when using `--camera`.
 
@@ -84,7 +84,6 @@ chronixd-capture context --data-dir ~/chronixd-data --last 30m --detail | claude
 | Screenshots | `/tmp/chronixd-capture/{session}/screenshots/` | Temporary (OS cleanup) |
 | Camera images | `/tmp/chronixd-capture/{session}/cameras/` | Temporary |
 | Structured data (NDJSON) | `{data-dir}/captures/` | Persistent |
-| Summaries (NDJSON) | `{data-dir}/summaries/` | Persistent (written by external tools) |
 
 ### Install
 
