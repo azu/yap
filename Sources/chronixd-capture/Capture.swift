@@ -329,8 +329,9 @@ struct Capture: AsyncParsableCommand {
         let consumeTask = Task.detached {
             do {
                 for try await result in transcriber.results {
-                    let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty else { continue }
+                    guard let text = normalizedTranscriptionText(String(result.text.characters)) else {
+                        continue
+                    }
                     let startSec = result.range.start.seconds
                     let durSec = result.range.duration.seconds
                     let endSec = startSec + durSec
@@ -651,6 +652,12 @@ func runAppContextHook(dataDir: String, appName: String, windowTitle: String, pi
 }
 
 // MARK: - Helpers
+
+func normalizedTranscriptionText(_ text: String) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed != "。" else { return nil }
+    return trimmed
+}
 
 func normalizeURL(_ url: String?) -> String? {
     guard let url, !url.isEmpty else { return nil }
