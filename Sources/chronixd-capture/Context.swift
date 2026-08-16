@@ -27,8 +27,14 @@ struct Context: ParsableCommand {
     @Flag(name: .customLong("list-devices"), help: "List capture device hostnames found in capture files.")
     var listDevices: Bool = false
 
-    @Flag(name: .long, help: "Output all record types with full fields.")
+    @Flag(name: .long, help: "Output full fields for the included records.")
     var detail: Bool = false
+
+    @Flag(
+        name: .customLong("include-diagnostics"),
+        help: "Include raw speaker_span and diarization_health records in output. speaker_span is still used internally for speaker resolution."
+    )
+    var includeDiagnostics: Bool = false
 
     @Flag(name: .long, help: "Print the output schema for AI consumption.")
     var schema: Bool = false
@@ -93,6 +99,33 @@ struct Context: ParsableCommand {
         records.sort { lhs, rhs in
             timeMs(of: lhs) < timeMs(of: rhs)
         }
+        let speakerDataStore = SpeakerStore(dataDir: dataDir)
+        let sessionIds = Set(records.compactMap(Self.sessionId))
+        let profileResolver: SpeakerProfileResolver?
+        do {
+            let mappings = try speakerDataStore.loadMappings()
+            let profiles = try SpeakerProfileBuilder.build(
+                store: speakerDataStore,
+                mappings: mappings
+            )
+            profileResolver = SpeakerProfileResolver(
+                samples: try speakerDataStore.loadSamples(sessionIds: sessionIds),
+                mappings: mappings,
+                profiles: profiles
+            )
+        } catch {
+            profileResolver = nil
+            FileHandle.standardError.write(Data("[context] Speaker profile data could not be loaded: \(error)\n".utf8))
+        }
+        // CaptureStore includes speaker spans that overlap the requested time
+        // range, even when a span starts just before --from. No full-session
+        // scan is needed to backfill a transcription at the query boundary.
+        let speakerSpans = records.compactMap { $0 as? SpeakerSpanRecord }
+        if !includeDiagnostics {
+            records.removeAll { record in
+                record is SpeakerSpanRecord || record is DiarizationHealthRecord
+            }
+        }
 
         if detail {
             for record in records {
@@ -127,6 +160,17 @@ struct Context: ParsableCommand {
                     )
                     let line = try CaptureRecordCoder.encodeDetail(detailRecord)
                     print(line)
+                case let r as TranscriptionRecord:
+                    print(try CaptureRecordCoder.encodeDetail(Self.resolve(
+                        transcription: r,
+                        spans: speakerSpans,
+                        profiles: profileResolver
+                    )))
+                case let r as SpeakerSpanRecord:
+                    print(try CaptureRecordCoder.encodeDetail(Self.resolve(
+                        speakerSpan: r,
+                        profiles: profileResolver
+                    )))
                 default:
                     let line = try CaptureRecordCoder.encode(record)
                     print(line)
@@ -135,15 +179,92 @@ struct Context: ParsableCommand {
         } else {
             // Index mode: all records but without tmp file paths
             for record in records {
-                let line = try CaptureRecordCoder.encode(record)
-                print(line)
+                switch record {
+                case let r as TranscriptionRecord:
+                    print(try CaptureRecordCoder.encodeDetail(Self.resolve(
+                        transcription: r,
+                        spans: speakerSpans,
+                        profiles: profileResolver
+                    )))
+                case let r as SpeakerSpanRecord:
+                    print(try CaptureRecordCoder.encodeDetail(Self.resolve(
+                        speakerSpan: r,
+                        profiles: profileResolver
+                    )))
+                default:
+                    print(try CaptureRecordCoder.encode(record))
+                }
             }
+        }
+    }
+
+    private static func resolve(
+        transcription: TranscriptionRecord,
+        spans: [SpeakerSpanRecord],
+        profiles: SpeakerProfileResolver?
+    ) -> ResolvedTranscriptionRecord {
+        let index = resolvedSpeakerIndex(for: transcription, spans: spans)
+        let sessionSpeakerId: String? = if let sessionId = transcription.sessionId, let index {
+            "\(sessionId)_\(index)"
+        } else {
+            transcription.speakerId
+        }
+        let profileId: String? = if let sessionId = transcription.sessionId, let index {
+            profiles?.profileId(sessionId: sessionId, speakerIndex: index, at: transcription.unixTimeMs)
+        } else {
+            nil
+        }
+        return ResolvedTranscriptionRecord(
+            unixTimeMs: transcription.unixTimeMs,
+            endUnixTimeMs: transcription.endUnixTimeMs,
+            sessionId: transcription.sessionId,
+            rms: transcription.rms,
+            device: transcription.device,
+            speakerId: sessionSpeakerId,
+            profileId: profileId,
+            text: transcription.text
+        )
+    }
+
+    private static func resolve(
+        speakerSpan: SpeakerSpanRecord,
+        profiles: SpeakerProfileResolver?
+    ) -> ResolvedSpeakerSpanRecord {
+        let profileId: String? = if let sessionId = speakerSpan.sessionId {
+            profiles?.profileId(
+                sessionId: sessionId,
+                speakerIndex: speakerSpan.speakerIndex,
+                at: speakerSpan.unixTimeMs
+            )
+        } else {
+            nil
+        }
+        return ResolvedSpeakerSpanRecord(
+            unixTimeMs: speakerSpan.unixTimeMs,
+            endUnixTimeMs: speakerSpan.endUnixTimeMs,
+            sessionId: speakerSpan.sessionId,
+            speakerId: speakerSpan.speakerId,
+            profileId: profileId,
+            speakerIndex: speakerSpan.speakerIndex,
+            isFinal: speakerSpan.isFinal,
+            source: speakerSpan.source
+        )
+    }
+
+    private static func sessionId(of record: any CaptureRecord) -> String? {
+        switch record {
+        case let r as ScreenshotRecord: return r.sessionId
+        case let r as TranscriptionRecord: return r.sessionId
+        case let r as CameraRecord: return r.sessionId
+        case let r as SpeakerSpanRecord: return r.sessionId
+        case let r as DiarizationHealthRecord: return r.sessionId
+        default: return nil
         }
     }
 
     // MARK: - Time Parsing
 
-    static func parseTime(_ str: String) throws -> Int64 {
+    static func parseTime(_ str: String, relativeTo referenceDate: Date = Date()) throws -> Int64 {
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime]
         if let date = isoFormatter.date(from: str) {
@@ -162,8 +283,7 @@ struct Context: ParsableCommand {
         timeOnly.timeZone = .current
         if let parsed = timeOnly.date(from: str) {
             let calendar = Calendar.current
-            let now = Date()
-            var components = calendar.dateComponents([.year, .month, .day], from: now)
+            var components = calendar.dateComponents([.year, .month, .day], from: referenceDate)
             let timeComponents = calendar.dateComponents([.hour, .minute], from: parsed)
             components.hour = timeComponents.hour
             components.minute = timeComponents.minute
@@ -218,6 +338,7 @@ struct Context: ParsableCommand {
 
     static let schemaText = """
     chronixd-capture context outputs NDJSON (one JSON object per line). Each record has a "type" field.
+    By default, raw speaker_span and diarization_health diagnostics are omitted from output. speaker_span is still used internally for speaker resolution. Pass --include-diagnostics to emit both record types.
 
     ## Common Fields
 
@@ -254,7 +375,8 @@ struct Context: ParsableCommand {
     - text: string — transcribed text
     - rms: number? — average RMS amplitude over the segment (0.0–1.0). Higher = louder = closer to mic, useful as a self-vs-others heuristic.
     - device: string? — input device name at capture time (e.g. "MacBook Air Microphone", "AirPods Pro")
-    - speakerId: string? — session-scoped anonymous speaker ID in "{sessionId}_{N}" format (e.g. "a1b2c3d4_0"). Same N within a session = same speaker. Cross-session matching not supported (no global identity).
+    - speakerId: string? — session-scoped anonymous speaker ID in "{sessionId}_{N}" format (e.g. "a1b2c3d4_0"). context resolves this from saved speaker_span when possible.
+    - profileId: string? — persistent speaker profile resolved from a manual mapping or a high-confidence embedding match. Same value can be used across sessions.
 
     ### camera
     Camera image metadata (when --camera is used with chronixd-capture capture).
@@ -267,6 +389,50 @@ struct Context: ParsableCommand {
     - path: string? — camera image file path
     - available: boolean — whether the image file exists
 
+    ### speaker_span
+    A finalized speaker interval emitted by FluidAudio Sortformer. Unlike transcription.speakerId, spans are not merged into ASR result boundaries.
+    - type: "speaker_span"
+    - unixTimeMs: number — finalized speaker interval START timestamp (Unix ms)
+    - endUnixTimeMs: number — finalized speaker interval END timestamp (Unix ms)
+    - sessionId: string? — see Common Fields
+    - speakerId: string — session-scoped anonymous speaker ID in "{sessionId}_{N}" format
+    - profileId: string? — persistent speaker profile resolved from a manual mapping or a high-confidence embedding match
+    - speakerIndex: number — Sortformer speaker cluster index (0–3)
+    - isFinal: boolean — always true; only finalized intervals are saved
+    - source: object — diarization library, model, and variant metadata
+      - library: "FluidAudio"
+      - libraryVersion: "0.14.4"
+      - model: "sortformer"
+      - variant: "fastV2_1"
+
+    ### diarization_health
+    Once-per-minute progress and error counters for comparing Apple ASR and FluidAudio on the same audio timeline.
+    - type: "diarization_health"
+    - unixTimeMs: number — health snapshot timestamp (Unix ms)
+    - sessionId: string? — see Common Fields
+    - status: string — "running", "disabled", "unsupported_audio_format", or "initialization_failed"
+    - source: object — same diarization library, model, and variant metadata as speaker_span
+    - audioInputEndSec: number? — total microphone audio submitted since session start
+    - diarizationSyntheticSilenceSec: number? — cumulative silence inserted because the bounded FluidAudio input queue dropped older audio
+    - asrLastResultEndSec: number? — end position of the latest Apple ASR result
+    - diarizationProcessedEndSec: number? — end position processed by FluidAudio
+    - asrDiarizationLagSec: number? — ASR result end minus FluidAudio processed end; positive means FluidAudio is behind ASR
+    - audioDiarizationBacklogSec: number? — audio input end minus FluidAudio processed end
+    - audioWallClockLagSec: number? — wall-clock elapsed time minus submitted microphone audio; detects dropped input that affects ASR and diarization equally
+    - asrResultCount: number — cumulative Apple ASR results
+    - asrErrorCount: number — cumulative Apple ASR stream errors
+    - diarizationProcessCallCount: number — cumulative FluidAudio process() calls
+    - diarizationUpdateCount: number — cumulative non-nil FluidAudio updates
+    - diarizationFinalizedSpanCount: number — cumulative finalized speaker intervals
+    - diarizationAddAudioErrorCount: number — cumulative FluidAudio audio input errors
+    - diarizationProcessErrorCount: number — cumulative FluidAudio process/finalize errors
+    - lastASRResultUnixTimeMs: number? — wall-clock time when the latest ASR result arrived
+    - lastDiarizationUpdateUnixTimeMs: number? — wall-clock time when the latest FluidAudio update arrived
+    - lastASRErrorUnixTimeMs: number? — wall-clock time of the latest Apple ASR error
+    - lastASRError: string? — latest Apple ASR error description
+    - lastDiarizationErrorUnixTimeMs: number? — wall-clock time of the latest FluidAudio error
+    - lastDiarizationError: string? — latest FluidAudio error description
+
     ## Usage
 
     # Get last 30 minutes of activity
@@ -274,6 +440,9 @@ struct Context: ParsableCommand {
 
     # Get full details including file paths
     chronixd-capture context --data-dir <path> --last 30m --detail
+
+    # Include raw speaker spans and once-per-minute health diagnostics
+    chronixd-capture context --data-dir <path> --last 30m --include-diagnostics
 
     # List capture devices available in the data directory
     chronixd-capture context --data-dir <path> --list-devices
@@ -300,10 +469,44 @@ struct Context: ParsableCommand {
     - is_focused: true indicates the display the user was actively using
     - idle_seconds: high values (e.g. >60) suggest the user is away; low values mean active interaction
     - scroll_position changes between consecutive records indicate the user is reading/scrolling
-    - speakerId stays stable within one session; "Speaker 0" today vs tomorrow are NOT the same person — use sessionId to scope
+    - speakerId stays stable within one session; use profileId for a mapped identity across sessions
     - rms can hint at self-vs-others (装着マイクの場合、自分の発話は loud、他者は遠くで quiet)
     - Summarize activity in 1-2 sentences per time period
     """
+}
+
+private struct ResolvedTranscriptionRecord: Codable {
+    let type: CaptureRecordType = .transcription
+    let unixTimeMs: Int64
+    let endUnixTimeMs: Int64
+    let sessionId: String?
+    let rms: Float?
+    let device: String?
+    let speakerId: String?
+    let profileId: String?
+    let text: String
+
+    enum CodingKeys: String, CodingKey {
+        case type, unixTimeMs, endUnixTimeMs, sessionId, rms, device
+        case speakerId, profileId, text
+    }
+}
+
+private struct ResolvedSpeakerSpanRecord: Codable {
+    let type: CaptureRecordType = .speakerSpan
+    let unixTimeMs: Int64
+    let endUnixTimeMs: Int64
+    let sessionId: String?
+    let speakerId: String
+    let profileId: String?
+    let speakerIndex: Int
+    let isFinal: Bool
+    let source: DiarizationSource
+
+    enum CodingKeys: String, CodingKey {
+        case type, unixTimeMs, endUnixTimeMs, sessionId
+        case speakerId, profileId, speakerIndex, isFinal, source
+    }
 }
 
 private func timeMs(of record: any CaptureRecord) -> Int64 {
@@ -311,6 +514,8 @@ private func timeMs(of record: any CaptureRecord) -> Int64 {
     case let r as ScreenshotRecord: return r.unixTimeMs
     case let r as TranscriptionRecord: return r.unixTimeMs
     case let r as CameraRecord: return r.unixTimeMs
+    case let r as SpeakerSpanRecord: return r.unixTimeMs
+    case let r as DiarizationHealthRecord: return r.unixTimeMs
     default: return 0
     }
 }

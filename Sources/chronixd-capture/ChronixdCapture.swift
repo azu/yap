@@ -10,6 +10,7 @@ import ArgumentParser
             Cameras.self,
             Capture.self,
             Context.self,
+            Speakers.self,
             Snapshot.self,
         ],
         defaultSubcommand: Capture.self

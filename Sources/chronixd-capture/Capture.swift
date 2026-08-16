@@ -8,6 +8,11 @@ import Speech
 
 private nonisolated(unsafe) var captureSignalWriteFD: Int32 = -1
 
+private struct DiarizationAudioInput: Sendable {
+    let startSample: Int64
+    let samples: [Float]
+}
+
 // MARK: - Capture
 
 struct Capture: AsyncParsableCommand {
@@ -57,6 +62,11 @@ struct Capture: AsyncParsableCommand {
         name: .long,
         help: "Disable speaker diarization (FluidAudio Sortformer)."
     ) var noDiarize: Bool = false
+
+    @Flag(
+        name: .long,
+        help: "Disable persistent speaker identification (FluidAudio WeSpeaker)."
+    ) var noSpeakerIdentify: Bool = false
 
     @Option(
         name: .shortAndLong,
@@ -190,30 +200,70 @@ struct Capture: AsyncParsableCommand {
             && targetFormat.channelCount == 1
             && (targetFormat.commonFormat == .pcmFormatFloat32 || targetFormat.commonFormat == .pcmFormatInt16)
         let diarization: DiarizationStream?
+        let diarizationStatus: String
+        let diarizationStartupError: String?
+        let diarizationStartupErrorUnixTimeMs: Int64?
         if noDiarize {
             diarization = nil
+            diarizationStatus = "disabled"
+            diarizationStartupError = nil
+            diarizationStartupErrorUnixTimeMs = nil
         } else if !formatOK {
+            let message = "targetFormat is not 16kHz mono Float32/Int16 (sampleRate=\(targetFormat.sampleRate), channels=\(targetFormat.channelCount), format=\(targetFormat.commonFormat.rawValue))"
             if isatty(STDERR_FILENO) != 0 {
                 FileHandle.standardError.write(Data(
-                    "[diarize] Skipped: targetFormat is not 16kHz mono Float32/Int16 (sampleRate=\(targetFormat.sampleRate), channels=\(targetFormat.channelCount), format=\(targetFormat.commonFormat.rawValue))\n".utf8
+                    "[diarize] Skipped: \(message)\n".utf8
                 ))
             }
             diarization = nil
+            diarizationStatus = "unsupported_audio_format"
+            diarizationStartupError = message
+            diarizationStartupErrorUnixTimeMs = Int64(Date().timeIntervalSince1970 * 1000)
         } else {
             if isatty(STDERR_FILENO) != 0 {
                 FileHandle.standardError.write(Data("[diarize] Initializing Sortformer (session=\(sessionId), model download on first run)…\n".utf8))
             }
             do {
                 diarization = try await DiarizationStream(sessionId: sessionId)
+                diarizationStatus = "running"
+                diarizationStartupError = nil
+                diarizationStartupErrorUnixTimeMs = nil
                 if isatty(STDERR_FILENO) != 0 {
                     FileHandle.standardError.write(Data("[diarize] Ready.\n".utf8))
                 }
             } catch {
+                let message = String(describing: error)
                 if isatty(STDERR_FILENO) != 0 {
-                    FileHandle.standardError.write(Data("[diarize] Init failed (\(error)). Continuing without speaker diarization.\n".utf8))
+                    FileHandle.standardError.write(Data("[diarize] Init failed (\(message)). Continuing without speaker diarization.\n".utf8))
                 }
                 diarization = nil
+                diarizationStatus = "initialization_failed"
+                diarizationStartupError = message
+                diarizationStartupErrorUnixTimeMs = Int64(Date().timeIntervalSince1970 * 1000)
             }
+        }
+
+        // Persistent identity is optional and must never prevent normal capture.
+        let speakerStore = SpeakerStore(dataDir: dataDir)
+        let speakerIdentity: SpeakerIdentityStream?
+        if diarization != nil, !noSpeakerIdentify {
+            if isatty(STDERR_FILENO) != 0 {
+                FileHandle.standardError.write(Data("[speaker] Initializing WeSpeaker (model download on first run)…\n".utf8))
+            }
+            do {
+                try speakerStore.setup()
+                speakerIdentity = try await SpeakerIdentityStream(store: speakerStore)
+                if isatty(STDERR_FILENO) != 0 {
+                    FileHandle.standardError.write(Data("[speaker] Ready.\n".utf8))
+                }
+            } catch {
+                speakerIdentity = nil
+                if isatty(STDERR_FILENO) != 0 {
+                    FileHandle.standardError.write(Data("[speaker] Init failed (\(error)). Continuing without persistent speaker identification.\n".utf8))
+                }
+            }
+        } else {
+            speakerIdentity = nil
         }
 
         let capture = try MicrophoneCapture(
@@ -221,14 +271,49 @@ struct Capture: AsyncParsableCommand {
             inputContinuation: inputContinuation
         )
 
+        var diarizationAudioContinuation: AsyncStream<DiarizationAudioInput>.Continuation?
+        let diarizationAudioTask: Task<Void, Never>?
         if let diarization {
             let diarizationRef = diarization
             let sampleRate = targetFormat.sampleRate
+            let (audioStream, audioContinuation) = AsyncStream.makeStream(
+                of: DiarizationAudioInput.self,
+                bufferingPolicy: .bufferingNewest(64)
+            )
+            diarizationAudioContinuation = audioContinuation
+            var nextDiarizationSample: Int64 = 0
             capture.onConvertedBuffer = { buffer in
                 guard let samples = Self.extractFloatSamples(from: buffer) else { return }
-                Task {
+                let input = DiarizationAudioInput(
+                    startSample: nextDiarizationSample,
+                    samples: samples
+                )
+                nextDiarizationSample += Int64(samples.count)
+                audioContinuation.yield(input)
+            }
+            diarizationAudioTask = Task.detached {
+                var expectedSample: Int64 = 0
+                for await input in audioStream {
                     do {
-                        try await diarizationRef.addAudio(samples, sourceSampleRate: sampleRate)
+                        // If the bounded queue dropped audio while inference was busy, insert
+                        // silence so Sortformer and Apple Speech keep the same audio timeline.
+                        var missingSamples = max(0, input.startSample - expectedSample)
+                        while missingSamples > 0 {
+                            let chunkSize = Int(min(missingSamples, Int64(sampleRate)))
+                            try await diarizationRef.addAudio(
+                                [Float](repeating: 0, count: chunkSize),
+                                sourceSampleRate: sampleRate,
+                                isSyntheticSilence: true
+                            )
+                            expectedSample += Int64(chunkSize)
+                            missingSamples -= Int64(chunkSize)
+                        }
+                        let alreadyConsumed = Int(max(0, expectedSample - input.startSample))
+                        if alreadyConsumed < input.samples.count {
+                            let remaining = Array(input.samples[Int(alreadyConsumed)...])
+                            try await diarizationRef.addAudio(remaining, sourceSampleRate: sampleRate)
+                            expectedSample = input.startSample + Int64(input.samples.count)
+                        }
                     } catch {
                         if isatty(STDERR_FILENO) != 0 {
                             FileHandle.standardError.write(Data("[diarize] addAudio failed: \(error)\n".utf8))
@@ -236,6 +321,8 @@ struct Capture: AsyncParsableCommand {
                     }
                 }
             }
+        } else {
+            diarizationAudioTask = nil
         }
 
         try capture.start()
@@ -279,6 +366,7 @@ struct Capture: AsyncParsableCommand {
 
         // Thread-safe transcription buffer
         let transcriptionBuffer = TranscriptionBuffer()
+        let asrProgressTracker = ASRProgressTracker()
 
         // Screen context capture
         let screenCapture = ScreenContextCapture()
@@ -316,7 +404,34 @@ struct Capture: AsyncParsableCommand {
             Task.detached {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    try? await diarization.processIfReady()
+                    guard !Task.isCancelled else { break }
+                    do {
+                        try await diarization.processIfReady()
+                    } catch {
+                        if isatty(STDERR_FILENO) != 0 {
+                            FileHandle.standardError.write(Data("[diarize] process failed: \(error)\n".utf8))
+                        }
+                    }
+                }
+            }
+        } else {
+            nil
+        }
+
+        // Background task: extract and persist cross-session speaker embeddings.
+        let speakerEmbeddingTask: Task<Void, Never>? = if let diarization, let speakerIdentity {
+            Task.detached {
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    guard !Task.isCancelled else { break }
+                    await persistSpeakerEmbeddingCandidates(
+                        from: diarization,
+                        identity: speakerIdentity,
+                        store: speakerStore,
+                        engineStartUnixMs: engineStartUnixMs,
+                        sessionId: sessionId,
+                        device: capture.currentDeviceName
+                    )
                 }
             }
         } else {
@@ -329,12 +444,13 @@ struct Capture: AsyncParsableCommand {
         let consumeTask = Task.detached {
             do {
                 for try await result in transcriber.results {
-                    guard let text = normalizedTranscriptionText(String(result.text.characters)) else {
-                        continue
-                    }
                     let startSec = result.range.start.seconds
                     let durSec = result.range.duration.seconds
                     let endSec = startSec + durSec
+                    await asrProgressTracker.recordResult(endSec: endSec)
+                    guard let text = normalizedTranscriptionText(String(result.text.characters)) else {
+                        continue
+                    }
                     let startMs = engineStartUnixMs + Int64(startSec * 1000)
                     let endMs = engineStartUnixMs + Int64(endSec * 1000)
                     let rms = consumeCapture.averageRMS(fromAudioTimeSec: startSec, toAudioTimeSec: endSec)
@@ -349,8 +465,38 @@ struct Capture: AsyncParsableCommand {
                         speakerId: speakerId
                     ))
                 }
+            } catch is CancellationError {
+                // Normal shutdown.
             } catch {
-                // Transcriber ended (e.g. after finalize)
+                await asrProgressTracker.record(error: error)
+            }
+        }
+
+        // Background task: save a progress/error snapshot every minute.
+        let healthTask = Task.detached {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard !Task.isCancelled else { break }
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                let asrSnapshot = await asrProgressTracker.snapshot()
+                let diarizationSnapshot = await diarization?.healthSnapshot()
+                let record = makeDiarizationHealthRecord(
+                    unixTimeMs: nowMs,
+                    engineStartUnixMs: engineStartUnixMs,
+                    sessionId: sessionId,
+                    status: diarizationStatus,
+                    startupError: diarizationStartupError,
+                    startupErrorUnixTimeMs: diarizationStartupErrorUnixTimeMs,
+                    asr: asrSnapshot,
+                    diarization: diarizationSnapshot
+                )
+                do {
+                    try store.writeCapture(records: [record], timestamp: Date(timeIntervalSince1970: Double(nowMs) / 1000))
+                } catch {
+                    if isatty(STDERR_FILENO) != 0 {
+                        FileHandle.standardError.write(Data("[diarize] Health write failed: \(error)\n".utf8))
+                    }
+                }
             }
         }
 
@@ -367,24 +513,25 @@ struct Capture: AsyncParsableCommand {
                 let nowMs = Int64(now.timeIntervalSince1970 * 1000)
 
                 // Capture screen context
-                let screenContext: ScreenContext
+                let screenContext: ScreenContext?
                 do {
                     screenContext = try await screenCapture.capture()
                 } catch {
                     if isatty(STDERR_FILENO) != 0 {
                         FileHandle.standardError.write(Data("[capture] Screen capture failed: \(error)\n".utf8))
                     }
-                    continue
+                    screenContext = nil
                 }
 
                 // Flush transcription buffer
                 let segments = transcriptionBuffer.flush()
+                let finalizedSpeakerSegments = await diarization?.finalizedSegmentsForPersistence() ?? []
 
                 // Build records
                 var records: [any CaptureRecord] = []
 
                 // Screenshot records for each display (skip ignored + per-display dedup)
-                for display in screenContext.displays {
+                for display in screenContext?.displays ?? [] {
                     if let ignoreAppPatterns, let appName = display.appName,
                        ignoreAppPatterns.contains(where: { appName.localizedCaseInsensitiveContains($0) }) {
                         continue
@@ -452,6 +599,15 @@ struct Capture: AsyncParsableCommand {
                     ))
                 }
 
+                // Raw finalized speaker intervals. Keep these independent from ASR result boundaries.
+                for segment in finalizedSpeakerSegments {
+                    records.append(makeSpeakerSpanRecord(
+                        segment: segment,
+                        engineStartUnixMs: engineStartUnixMs,
+                        sessionId: sessionId
+                    ))
+                }
+
                 // Camera records
                 if let cameraCapture {
                     let cameraImages = await cameraCapture.captureAll()
@@ -477,12 +633,16 @@ struct Capture: AsyncParsableCommand {
                 if !records.isEmpty {
                     do {
                         try captureStore.writeCapture(records: records, timestamp: now)
+                        await diarization?.acknowledgePersistedFinalizedSegments(
+                            count: finalizedSpeakerSegments.count
+                        )
                         if isatty(STDERR_FILENO) != 0 {
                             let screenshotCount = records.filter { $0 is ScreenshotRecord }.count
                             let transcriptionCount = records.filter { $0 is TranscriptionRecord }.count
                             let cameraCount = records.filter { $0 is CameraRecord }.count
+                            let speakerSpanCount = records.filter { $0 is SpeakerSpanRecord }.count
                             FileHandle.standardError.write(Data(
-                                "[capture] Wrote \(records.count) records (screenshots: \(screenshotCount), transcriptions: \(transcriptionCount), cameras: \(cameraCount))\n".utf8
+                                "[capture] Wrote \(records.count) records (screenshots: \(screenshotCount), transcriptions: \(transcriptionCount), cameras: \(cameraCount), speaker spans: \(speakerSpanCount))\n".utf8
                             ))
                         }
                     } catch {
@@ -508,15 +668,84 @@ struct Capture: AsyncParsableCommand {
             }
             capture.onConvertedBuffer = nil
             capture.stop()
+            diarizationAudioContinuation?.finish()
+            if let diarizationAudioTask {
+                _ = await diarizationAudioTask.result
+            }
             cameraCapture?.stop()
             if !capture.isMuted {
                 try? await analyzer.finalizeAndFinishThroughEndOfInput()
             }
-            diarizationProcessTask?.cancel()
+            if let diarizationProcessTask {
+                diarizationProcessTask.cancel()
+                _ = await diarizationProcessTask.result
+            }
             try? await diarization?.finalize()
+            if let speakerEmbeddingTask {
+                speakerEmbeddingTask.cancel()
+                _ = await speakerEmbeddingTask.result
+            }
+            if let diarization, let speakerIdentity {
+                await persistSpeakerEmbeddingCandidates(
+                    from: diarization,
+                    identity: speakerIdentity,
+                    store: speakerStore,
+                    engineStartUnixMs: engineStartUnixMs,
+                    sessionId: sessionId,
+                    device: capture.currentDeviceName
+                )
+            }
+            healthTask.cancel()
+            _ = await healthTask.result
             captureTimerTask.cancel()
+            _ = await captureTimerTask.result
             consumeTask.cancel()
+            _ = await consumeTask.result
             mediaCheckTask.cancel()
+
+            var finalRecords: [any CaptureRecord] = []
+            for segment in transcriptionBuffer.flush() {
+                finalRecords.append(TranscriptionRecord(
+                    unixTimeMs: segment.startUnixMs,
+                    endUnixTimeMs: segment.endUnixMs,
+                    sessionId: sessionId,
+                    rms: segment.rms,
+                    device: segment.device,
+                    speakerId: segment.speakerId,
+                    text: segment.text
+                ))
+            }
+            let finalSpeakerSegments = await diarization?.finalizedSegmentsForPersistence() ?? []
+            for segment in finalSpeakerSegments {
+                finalRecords.append(makeSpeakerSpanRecord(
+                    segment: segment,
+                    engineStartUnixMs: engineStartUnixMs,
+                    sessionId: sessionId
+                ))
+            }
+            let now = Date()
+            let asrSnapshot = await asrProgressTracker.snapshot()
+            let diarizationSnapshot = await diarization?.healthSnapshot()
+            finalRecords.append(makeDiarizationHealthRecord(
+                unixTimeMs: Int64(now.timeIntervalSince1970 * 1000),
+                engineStartUnixMs: engineStartUnixMs,
+                sessionId: sessionId,
+                status: diarizationStatus,
+                startupError: diarizationStartupError,
+                startupErrorUnixTimeMs: diarizationStartupErrorUnixTimeMs,
+                asr: asrSnapshot,
+                diarization: diarizationSnapshot
+            ))
+            do {
+                try store.writeCapture(records: finalRecords, timestamp: now)
+                await diarization?.acknowledgePersistedFinalizedSegments(
+                    count: finalSpeakerSegments.count
+                )
+            } catch {
+                if isatty(STDERR_FILENO) != 0 {
+                    FileHandle.standardError.write(Data("[capture] Final write failed: \(error)\n".utf8))
+                }
+            }
             if isatty(STDERR_FILENO) != 0 {
                 FileHandle.standardError.write(Data("\nCapture stopped.\n".utf8))
             }
@@ -561,6 +790,115 @@ private final class TranscriptionBuffer: @unchecked Sendable {
         lock.unlock()
         return result
     }
+}
+
+func persistSpeakerEmbeddingCandidates(
+    from diarization: DiarizationStream,
+    identity: SpeakerIdentityStream,
+    store: SpeakerStore,
+    engineStartUnixMs: Int64,
+    sessionId: String,
+    device: String?
+) async {
+    let candidates = await diarization.drainEmbeddingCandidates()
+    for candidate in candidates {
+        do {
+            let sample = try await identity.identify(
+                candidate: candidate,
+                engineStartUnixMs: engineStartUnixMs,
+                sessionId: sessionId,
+                device: device
+            )
+            try store.append(
+                sample: sample,
+                timestamp: Date(timeIntervalSince1970: Double(sample.unixTimeMs) / 1000)
+            )
+        } catch {
+            if isatty(STDERR_FILENO) != 0 {
+                FileHandle.standardError.write(Data("[speaker] Embedding failed: \(error)\n".utf8))
+            }
+        }
+    }
+}
+
+func makeSpeakerSpanRecord(
+    segment: DiarizationSegmentRecord,
+    engineStartUnixMs: Int64,
+    sessionId: String
+) -> SpeakerSpanRecord {
+    SpeakerSpanRecord(
+        unixTimeMs: engineStartUnixMs + Int64(segment.startSec * 1000),
+        endUnixTimeMs: engineStartUnixMs + Int64(segment.endSec * 1000),
+        sessionId: sessionId,
+        speakerId: "\(sessionId)_\(segment.speakerIndex)",
+        speakerIndex: segment.speakerIndex,
+        isFinal: true,
+        source: .init(
+            library: DiarizationMetadata.library,
+            libraryVersion: DiarizationMetadata.libraryVersion,
+            model: DiarizationMetadata.model,
+            variant: DiarizationMetadata.variant
+        )
+    )
+}
+
+func makeDiarizationHealthRecord(
+    unixTimeMs: Int64,
+    engineStartUnixMs: Int64,
+    sessionId: String,
+    status: String,
+    startupError: String?,
+    startupErrorUnixTimeMs: Int64?,
+    asr: ASRProgressSnapshot,
+    diarization: DiarizationHealthSnapshot?
+) -> DiarizationHealthRecord {
+    let processedEndSec = diarization?.diarizationProcessedEndSec
+    let asrLagSec: Double? = if let asrEndSec = asr.lastResultEndSec, let processedEndSec {
+        asrEndSec - processedEndSec
+    } else {
+        nil
+    }
+    let audioBacklogSec: Double? = if let audioInputEndSec = diarization?.audioInputEndSec, let processedEndSec {
+        max(0, audioInputEndSec - processedEndSec)
+    } else {
+        nil
+    }
+    let audioWallClockLagSec: Double? = if let audioInputEndSec = diarization?.audioInputEndSec {
+        max(0, Double(unixTimeMs - engineStartUnixMs) / 1000 - audioInputEndSec)
+    } else {
+        nil
+    }
+    return DiarizationHealthRecord(
+        unixTimeMs: unixTimeMs,
+        sessionId: sessionId,
+        status: status,
+        source: .init(
+            library: DiarizationMetadata.library,
+            libraryVersion: DiarizationMetadata.libraryVersion,
+            model: DiarizationMetadata.model,
+            variant: DiarizationMetadata.variant
+        ),
+        audioInputEndSec: diarization?.audioInputEndSec,
+        diarizationSyntheticSilenceSec: diarization?.syntheticSilenceSec,
+        asrLastResultEndSec: asr.lastResultEndSec,
+        diarizationProcessedEndSec: processedEndSec,
+        asrDiarizationLagSec: asrLagSec,
+        audioDiarizationBacklogSec: audioBacklogSec,
+        audioWallClockLagSec: audioWallClockLagSec,
+        asrResultCount: asr.resultCount,
+        asrErrorCount: asr.errorCount,
+        diarizationProcessCallCount: diarization?.processCallCount ?? 0,
+        diarizationUpdateCount: diarization?.updateCount ?? 0,
+        diarizationFinalizedSpanCount: diarization?.finalizedSpanCount ?? 0,
+        diarizationAddAudioErrorCount: diarization?.addAudioErrorCount ?? 0,
+        diarizationProcessErrorCount: diarization?.processErrorCount ?? 0,
+        lastASRResultUnixTimeMs: asr.lastResultUnixTimeMs,
+        lastDiarizationUpdateUnixTimeMs: diarization?.lastDiarizationUpdateUnixTimeMs,
+        lastASRErrorUnixTimeMs: asr.lastErrorUnixTimeMs,
+        lastASRError: asr.lastError,
+        lastDiarizationErrorUnixTimeMs: diarization?.lastErrorUnixTimeMs ?? startupErrorUnixTimeMs,
+        lastDiarizationError: diarization?.lastError ?? startupError
+    )
 }
 
 // MARK: - DedupKey

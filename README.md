@@ -8,19 +8,22 @@ A CLI for periodic screen context capture and querying on macOS 26. Captures scr
 |---------|-------------|
 | `capture` | Capture transcription and screen context periodically to disk (default) |
 | `context` | Query captured context data by time range |
+| `speakers` | Review and map persistent speaker profiles |
 | `snapshot` | One-time screen context snapshot |
 | `cameras` | List available cameras |
 
 ### Capture
 
 ```
-USAGE: chronixd-capture capture --data-dir <data-dir> [--interval <interval>] [--camera <camera> ...] [--no-dedup] [--locale <locale>]
+USAGE: chronixd-capture capture --data-dir <data-dir> [--interval <interval>] [--camera <camera> ...] [--no-dedup] [--no-diarize] [--no-speaker-identify] [--locale <locale>]
 
 OPTIONS:
   --data-dir <data-dir>   Persistent data directory (required).
   --interval <interval>   Capture interval in seconds (default: 30, minimum: 5).
   --camera <camera>       Camera device ID to capture. Can be specified multiple times.
   --no-dedup              Disable deduplication.
+  --no-diarize            Disable speaker diarization (FluidAudio Sortformer).
+  --no-speaker-identify   Disable persistent speaker identification (FluidAudio WeSpeaker).
   -l, --locale <locale>   (default: current)
   -h, --help              Show help information.
 ```
@@ -28,7 +31,7 @@ OPTIONS:
 ### Context
 
 ```
-USAGE: chronixd-capture context --data-dir <data-dir> [--from <from>] [--to <to>] [--last <last>] [--device <device> ...] [--list-devices] [--detail] [--schema]
+USAGE: chronixd-capture context --data-dir <data-dir> [--from <from>] [--to <to>] [--last <last>] [--device <device> ...] [--list-devices] [--detail] [--include-diagnostics] [--schema]
 
 OPTIONS:
   --data-dir <data-dir>   Data directory (required).
@@ -37,12 +40,44 @@ OPTIONS:
   --last <last>           Duration like 30m, 1h, 2h30m.
   --device <device>       Capture device hostname to include. Repeat for multiple devices, or use `current` for this Mac. Defaults to all.
   --list-devices          List capture device hostnames found in capture files.
-  --detail                Output all record types with full fields.
+  --detail                Output full fields for the included records.
+  --include-diagnostics   Include raw speaker_span and diarization_health records.
   --schema                Print the output schema for AI consumption.
   -h, --help              Show help information.
 ```
 
-Output is NDJSON with `type` field per record: `screenshot`, `transcription`, `camera`.
+Output is NDJSON with a `type` field. Normal output contains `screenshot`, `transcription`, and `camera` records. Raw `speaker_span` is used internally for speaker resolution; `speaker_span` and `diarization_health` are emitted only with `--include-diagnostics`.
+When persistent speaker data is available, `context` adds `profileId` to transcription records and to speaker spans when diagnostics are included.
+
+### Persistent Speakers
+
+Sortformer keeps `speakerId` stable inside one capture session. WeSpeaker embeddings and a manual mapping associate it with a persistent `profileId` reusable across sessions.
+
+```bash
+# Review the anonymous speakers and transcription excerpts in one session
+chronixd-capture speakers review --data-dir ~/chronixd-data --session a1b2c3d4
+
+# Confirm that speaker 0 in the session is the persistent profile "self"
+chronixd-capture speakers assign \
+  --data-dir ~/chronixd-data \
+  --session a1b2c3d4 \
+  --speaker-index 0 \
+  --profile self
+
+# List profiles reconstructed from confirmed and high-confidence samples
+chronixd-capture speakers list --data-dir ~/chronixd-data
+
+# Permanently remove one profile's mappings and associated embeddings
+# Stop capture before running this command.
+chronixd-capture speakers forget \
+  --data-dir ~/chronixd-data \
+  --profile self \
+  --confirm
+```
+
+The first confirmed session creates the initial profile. With at least two confirmed profiles, later matches update a profile only when both the distance and the gap from the second candidate are strong enough. A single profile can be recognized conservatively, but does not learn automatically because there is no competing voice to compare against.
+
+Embeddings are comparison data for a person's voice. Protect the data directory like other sensitive personal data. `speakers forget` removes the selected profile's mappings and currently associated embeddings, but capture must be stopped first because a running process keeps profiles in memory.
 
 > Microphone, Screen Recording, and Accessibility permissions are required. Camera permission is needed when using `--camera`.
 
@@ -60,6 +95,9 @@ chronixd-capture context --data-dir ~/chronixd-data --last 30m
 
 # Query with full details (image paths, transcription)
 chronixd-capture context --data-dir ~/chronixd-data --last 1h --detail
+
+# Inspect finalized speaker spans and once-per-minute health records
+chronixd-capture context --data-dir ~/chronixd-data --last 1h --include-diagnostics
 
 # List capture devices available in the data directory
 chronixd-capture context --data-dir ~/chronixd-data --list-devices
@@ -84,6 +122,7 @@ chronixd-capture context --data-dir ~/chronixd-data --last 30m --detail | claude
 | Screenshots | `/tmp/chronixd-capture/{session}/screenshots/` | Temporary (OS cleanup) |
 | Camera images | `/tmp/chronixd-capture/{session}/cameras/` | Temporary |
 | Structured data (NDJSON) | `{data-dir}/captures/` | Persistent |
+| Speaker embeddings and mappings (NDJSON) | `{data-dir}/speakers/` | Persistent |
 
 ### Install
 

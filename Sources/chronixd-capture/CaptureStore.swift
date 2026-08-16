@@ -1,10 +1,40 @@
+import Darwin
 import Foundation
+
+enum NDJSONFileAppender {
+    static func append(_ data: Data, to path: String) throws {
+        guard !data.isEmpty else { return }
+        let descriptor = Darwin.open(
+            path,
+            O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { Darwin.close(descriptor) }
+
+        let written = data.withUnsafeBytes { bytes -> Int in
+            guard let baseAddress = bytes.baseAddress else { return 0 }
+            return Darwin.write(descriptor, baseAddress, bytes.count)
+        }
+        guard written == data.count else {
+            let code = written < 0 ? Int(errno) : Int(EIO)
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: code,
+                userInfo: [NSLocalizedDescriptionKey: "Incomplete NDJSON append to \(path) (\(written)/\(data.count) bytes)"]
+            )
+        }
+    }
+}
 
 // MARK: - CaptureStore
 
 final class CaptureStore: Sendable {
     let dataDir: String
     let sessionID: String
+    private let writeLock = NSLock()
 
     var capturesDir: String { dataDir + "/captures/" }
     var tmpDir: String { NSTemporaryDirectory() + "chronixd-capture/" + sessionID + "/" }
@@ -45,6 +75,8 @@ final class CaptureStore: Sendable {
 
     /// Append records to the daily per-host NDJSON file (e.g. 2026-03-22_macbook.ndjson).
     func writeCapture(records: [any CaptureRecord], timestamp: Date) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         let lines = try records.map { try CaptureRecordCoder.encode($0) }
         let content = lines.joined(separator: "\n") + "\n"
         let data = Data(content.utf8)
@@ -54,14 +86,7 @@ final class CaptureStore: Sendable {
         let filename = "\(formatter.string(from: timestamp))_\(Self.currentDevice).ndjson"
         let path = capturesDir + filename
 
-        if FileManager.default.fileExists(atPath: path) {
-            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
-            try data.write(to: URL(fileURLWithPath: path))
-        }
+        try NDJSONFileAppender.append(data, to: path)
     }
 
     /// Read all records from captures within a time range.
@@ -70,7 +95,34 @@ final class CaptureStore: Sendable {
         to endMs: Int64,
         devices: Set<String>? = nil
     ) throws -> [any CaptureRecord] {
-        try readNDJSONFiles(in: capturesDir, from: startMs, to: endMs, devices: devices)
+        try readNDJSONFiles(
+            in: capturesDir,
+            from: startMs,
+            to: endMs,
+            devices: devices,
+            sessionIds: nil
+        )
+    }
+
+    /// Read capture records belonging to one process invocation across all daily files.
+    func readRecords(sessionId: String) throws -> [any CaptureRecord] {
+        try readRecords(sessionIds: [sessionId])
+    }
+
+    /// Read capture records for a set of process invocations with one file scan.
+    func readRecords(
+        sessionIds: Set<String>,
+        devices: Set<String>? = nil
+    ) throws -> [any CaptureRecord] {
+        guard !sessionIds.isEmpty else { return [] }
+        let records = try readNDJSONFiles(
+            in: capturesDir,
+            from: .min,
+            to: .max,
+            devices: devices,
+            sessionIds: sessionIds
+        )
+        return records
     }
 
     /// Capture device hostnames encoded in per-host NDJSON filenames.
@@ -108,25 +160,67 @@ final class CaptureStore: Sendable {
         in directory: String,
         from startMs: Int64,
         to endMs: Int64,
-        devices: Set<String>?
+        devices: Set<String>?,
+        sessionIds: Set<String>?
     ) throws -> [any CaptureRecord] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: directory) else { return [] }
+        let dayRange = Self.dayRange(from: startMs, to: endMs)
+        let sessionMarkers = sessionIds?.map { "\"sessionId\":\"\($0)\"" }
         var records: [any CaptureRecord] = []
         for file in files.sorted() where file.hasSuffix(".ndjson") {
+            if let dayRange, let fileDay = Self.dayPrefix(from: file),
+               fileDay < dayRange.start || fileDay > dayRange.end {
+                continue
+            }
             if let devices {
                 guard let device = Self.deviceName(from: file), devices.contains(device) else { continue }
             }
             let path = directory + file
             guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
             for line in content.components(separatedBy: "\n") where !line.isEmpty {
+                if let sessionMarkers,
+                   line.contains("\"sessionId\":\""),
+                   !sessionMarkers.contains(where: line.contains) {
+                    continue
+                }
                 guard let record = try? CaptureRecordCoder.decode(line: line) else { continue }
+                if let sessionIds,
+                   !(Self.sessionId(of: record).map(sessionIds.contains) ?? false) {
+                    continue
+                }
                 if isInRange(record: record, from: startMs, to: endMs) {
                     records.append(record)
                 }
             }
         }
         return records
+    }
+
+    private static func dayRange(from startMs: Int64, to endMs: Int64) -> (start: String, end: String)? {
+        guard startMs != .min, endMs != .max else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let calendar = Calendar.current
+        let startDate = Date(timeIntervalSince1970: Double(startMs) / 1_000)
+        let endDate = Date(timeIntervalSince1970: Double(endMs) / 1_000)
+        // A transcription can start before midnight and be flushed into the
+        // next day's file. The one-day padding also tolerates synced devices
+        // whose local calendar day differs from this Mac.
+        let paddedStart = calendar.date(byAdding: .day, value: -1, to: startDate) ?? startDate
+        let paddedEnd = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
+        return (
+            formatter.string(from: paddedStart),
+            formatter.string(from: paddedEnd)
+        )
+    }
+
+    private static func dayPrefix(from filename: String) -> String? {
+        guard let match = filename.prefix(10).wholeMatch(of: /\d{4}-\d{2}-\d{2}/) else {
+            return nil
+        }
+        return String(match.output)
     }
 
     private static func deviceName(from filename: String) -> String? {
@@ -138,11 +232,24 @@ final class CaptureStore: Sendable {
         return String(match.device)
     }
 
+    private static func sessionId(of record: any CaptureRecord) -> String? {
+        switch record {
+        case let r as ScreenshotRecord: return r.sessionId
+        case let r as TranscriptionRecord: return r.sessionId
+        case let r as CameraRecord: return r.sessionId
+        case let r as SpeakerSpanRecord: return r.sessionId
+        case let r as DiarizationHealthRecord: return r.sessionId
+        default: return nil
+        }
+    }
+
     private func isInRange(record: any CaptureRecord, from startMs: Int64, to endMs: Int64) -> Bool {
         switch record {
         case let r as ScreenshotRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         case let r as TranscriptionRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         case let r as CameraRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
+        case let r as SpeakerSpanRecord: return r.endUnixTimeMs >= startMs && r.unixTimeMs <= endMs
+        case let r as DiarizationHealthRecord: return r.unixTimeMs >= startMs && r.unixTimeMs <= endMs
         default: return false
         }
     }
