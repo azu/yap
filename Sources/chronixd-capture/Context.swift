@@ -3,7 +3,10 @@ import Foundation
 
 struct Context: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Query captured context data by time range."
+        abstract: "Query captured context data by time range.",
+        discussion: """
+        Output is NDJSON. Screenshot records include the foreground app, window title, and browser URL when available. --detail adds screenshot and camera image paths and whether those files are available. Use --schema for the complete field list.
+        """
     )
 
     @Option(name: .long, help: "Data directory (required).")
@@ -15,7 +18,7 @@ struct Context: ParsableCommand {
     @Option(name: .long, help: "End time (ISO 8601 or HH:mm for today). Defaults to now.")
     var to: String?
 
-    @Option(name: .long, help: "Duration like 30m, 1h, 2h30m, or seconds.")
+    @Option(name: .long, help: "Duration like 30m, 1h, 7d, 2h30m, or seconds.")
     var last: String?
 
     @Option(
@@ -27,7 +30,7 @@ struct Context: ParsableCommand {
     @Flag(name: .customLong("list-devices"), help: "List capture device hostnames found in capture files.")
     var listDevices: Bool = false
 
-    @Flag(name: .long, help: "Output full fields for the included records.")
+    @Flag(name: .long, help: "Add screenshot and camera image paths and availability.")
     var detail: Bool = false
 
     @Flag(
@@ -36,7 +39,7 @@ struct Context: ParsableCommand {
     )
     var includeDiagnostics: Bool = false
 
-    @Flag(name: .long, help: "Print the output schema for AI consumption.")
+    @Flag(name: .long, help: "Print all output fields, --detail additions, and usage notes.")
     var schema: Bool = false
 
     func validate() throws {
@@ -310,19 +313,20 @@ struct Context: ParsableCommand {
         while !remaining.isEmpty {
             let digits = remaining.prefix(while: { $0.isNumber || $0 == "." })
             guard !digits.isEmpty, let value = Double(digits) else {
-                throw ValidationError("Invalid duration format: \(str). Use formats like 30m, 1h, 2h30m.")
+                throw ValidationError("Invalid duration format: \(str). Use formats like 30m, 1h, 7d, 2h30m.")
             }
             remaining = remaining[digits.endIndex...]
 
             guard let unit = remaining.first else {
-                throw ValidationError("Invalid duration format: \(str). Missing unit (h/m/s).")
+                throw ValidationError("Invalid duration format: \(str). Missing unit (d/h/m/s).")
             }
             switch unit {
+            case "d": totalSeconds += value * 86_400
             case "h": totalSeconds += value * 3600
             case "m": totalSeconds += value * 60
             case "s": totalSeconds += value
             default:
-                throw ValidationError("Invalid duration unit '\(unit)' in: \(str). Use h, m, or s.")
+                throw ValidationError("Invalid duration unit '\(unit)' in: \(str). Use d, h, m, or s.")
             }
             remaining = remaining[remaining.index(after: remaining.startIndex)...]
             matched = true

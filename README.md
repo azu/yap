@@ -37,16 +37,16 @@ OPTIONS:
   --data-dir <data-dir>   Data directory (required).
   --from <from>           Start time (ISO 8601 or HH:mm for today).
   --to <to>               End time (defaults to now).
-  --last <last>           Duration like 30m, 1h, 2h30m.
+  --last <last>           Duration like 30m, 1h, 7d, 2h30m, or seconds.
   --device <device>       Capture device hostname to include. Repeat for multiple devices, or use `current` for this Mac. Defaults to all.
   --list-devices          List capture device hostnames found in capture files.
-  --detail                Output full fields for the included records.
+  --detail                Add screenshot and camera image paths and availability.
   --include-diagnostics   Include raw speaker_span and diarization_health records.
-  --schema                Print the output schema for AI consumption.
+  --schema                Print all output fields, --detail additions, and usage notes.
   -h, --help              Show help information.
 ```
 
-Output is NDJSON with a `type` field. Normal output contains `screenshot`, `transcription`, and `camera` records. Raw `speaker_span` is used internally for speaker resolution; `speaker_span` and `diarization_health` are emitted only with `--include-diagnostics`.
+Output is NDJSON with a `type` field. Normal output contains `screenshot`, `transcription`, and `camera` records. Screenshot records include the foreground app, window title, and browser URL when available. `--detail` adds screenshot and camera image paths and whether those files are available; it is not required for URLs or transcriptions. Use `--schema` to see the complete field list and the fields added by each option. Raw `speaker_span` is used internally for speaker resolution; `speaker_span` and `diarization_health` are emitted only with `--include-diagnostics`.
 When persistent speaker data is available, `context` adds `profileId` to transcription records and to speaker spans when diagnostics are included.
 
 ### Persistent Speakers
@@ -93,7 +93,10 @@ chronixd-capture capture --data-dir ~/chronixd-data --interval 10 --camera "buil
 # Query last 30 minutes
 chronixd-capture context --data-dir ~/chronixd-data --last 30m
 
-# Query with full details (image paths, transcription)
+# Last 7 days (7 x 24 hours)
+chronixd-capture context --data-dir ~/chronixd-data --last 7d
+
+# Add screenshot and camera image paths and availability
 chronixd-capture context --data-dir ~/chronixd-data --last 1h --detail
 
 # Inspect finalized speaker spans and once-per-minute health records
